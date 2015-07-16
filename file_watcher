@@ -3,9 +3,9 @@
 FIFO_QUEUE="/tmp/inotifywait.log"
 INOTIFYWAIT=`which inotifywait`
 EVENTS="move,create,delete,delete_self,unmount,modify"
-WATCH_DIRS=("/home/andy/AmazonCloudPusher/testdir")
 MAX_WATCHES=`cat /proc/sys/fs/inotify/max_user_watches`
 LIBS_DIR="libs"
+RUN_INOTIFYWAIT=true
 INOTIFY_OPTS=("--daemon" "--recursive" "--quiet" "--timefmt %H%M%S" "--format %w,%f,%e,%T" "-o $FIFO_QUEUE")
 INOTIFY_PID=
 
@@ -37,17 +37,44 @@ do
     case ${opt} in
         h) REDISHOST=${OPTARG};;
         p) REDISPORT=${OPTARG};;
-        r) WATCH_DIR=${OPTARG};;
-        c) CHANNEL=${OPTARG};;
     esac
 done
 shift $((${OPTIND} - 1))
+
+# Check if a value exists in an array
+# @param $1 mixed  Needle  
+# @param $2 array  Haystack
+# @return  Success (0) if value exists, Failure (1) otherwise
+# Usage: in_array "$needle" "${haystack[@]}"
+# See: http://fvue.nl/wiki/Bash:_Check_if_array_element_exists
+function in_array() {
+    local hay needle=$1
+    shift
+    for hay; do
+        [[ $hay == $needle ]] && return 0
+    done
+    return 1
+}
+
+function indexOf()    {
+    local i=1 S=$1; shift
+    while [ $S != $1 ]
+    do    ((i++)); shift
+        [ -z "$1" ] && { i=0; break; }
+    done
+    echo $i
+}
+
+function ctrl_c () {
+  finish
+  exit_handler
+}
 
 function exit_handler () {
   if [ -p "$FIFO_QUEUE" ]; then
     rm "$FIFO_QUEUE"
   fi
-  if [ "$INOTIFY_PID" != "" ] && ps -p $INOTIFY_PID > /dev/null; then
+  if [ "$INOTIFY_PID" != "" -a $(ps -p $INOTIFY_PID > /dev/null; echo $?) -gt 0 ]; then
     kill -9 $INOTIFY_PID
   fi
 }
@@ -70,7 +97,7 @@ function containsElement () {
 
 function create_fifo_queue () {
   # Create named pipe (if not exists)
-  if [ ! -p "$FIFO_QUEUE" ]; then 
+  if [ ! -p "$FIFO_QUEUE"  -a  ! -f "$FIFO_QUEUE" ]; then 
     mkfifo "$FIFO_QUEUE"
     return $?
   fi
@@ -78,40 +105,59 @@ function create_fifo_queue () {
 }
 
 function open_redis_connection () {
-# Open the connection
-exec 5>&-
-if [ "${REDISHOST}" != "" ] && [ "${REDISPORT}" != "" ]; then
-  exec 5<>/dev/tcp/${REDISHOST}/${REDISPORT} # open fd
-  if [ $? -ne 0 ]; then
+  # Open the connection
+  exec 5>&-
+  if [ "${REDISHOST}" != "" ] && [ "${REDISPORT}" != "" ]; then
+    exec 5<>/dev/tcp/${REDISHOST}/${REDISPORT} # open fd
+    if [ $? -ne 0 ]; then
+      error "Invalid Redis Connection Info $REDISHOST:$REDISPORT"
+      bad $RESULT
+      exit 255
+    fi
+  else
     error "Invalid Redis Connection Info $REDISHOST:$REDISPORT"
-    bad $RESULT
     exit 255
   fi
-else
-  error "Invalid Redis Connection Info $REDISHOST:$REDISPORT"
-  exit 255
-fi
-return $?
+  return $?
 }
 
-function diff_directories () {
-  #comm -23 <(ls $1 |sort) <(ls $2 |sort)
+function check_watch_dirs () {
+  for watchdir in "${WATCH_DIRS[@]}"
+  do
+   :
+   if [[ ! -d "$watchdir" ]]; then
+	error "Watch dir doesn't exist! $watchdir"
+	exit 1
+   fi
+  done
 }
 
+function start_inotifywait () {  
+  if [ $RUN_INOTIFYWAIT ]; then
+    #info "${INOTIFY_OPTS[@]} -e $EVENTS ${WATCH_DIRS[@]}"
+    "$INOTIFYWAIT" ${INOTIFY_OPTS[@]} -e $EVENTS ${WATCH_DIRS[@]}
+    if [ $? -ne 0 ]; then
+      error "inotify failed to start!"
+      bad "$OUTPUT"
+      exit 1
+    fi
+    INOTIFY_PID=`ps -ax | grep "$INOTIFYWAIT" | grep -v grep | head -n 1 | awk '{print $1}'`
+  fi
+  return 0
+}
+
+## Start main app here
 trap exit_handler EXIT
-trap exit_handler INT
+trap ctrl_c INT
 check_dependencies
+check_watch_dirs
 create_fifo_queue
 open_redis_connection
+start_inotifywait
 
-#info "${INOTIFY_OPTS[@]} -e $EVENTS ${WATCH_DIRS[@]}"
-"$INOTIFYWAIT" ${INOTIFY_OPTS[@]} -e $EVENTS ${WATCH_DIRS[@]}
-INOTIFY_PID=`ps -ax | grep "$INOTIFYWAIT" | grep -v grep | head -n 1 | awk '{print $1}'`
-
-if [ $? -ne 0 ]; then
-  error "inotify failed to start!"
-  bad "$OUTPUT"
-  exit 0
+if [ `ps -ax | grep "$INOTIFYWAIT" | grep -v grep | head -n 1 | awk '{print $1}'` = "" ]; then
+  error "inotifywait is not running!"
+  exit 1
 fi
 
 good "Ready to receive file events"
@@ -120,12 +166,32 @@ last_tm=""
 trap "true" PIPE
 
 cat "$FIFO_QUEUE" | while IFS=, read -r path file event time; do
-  SUBSCRIBER_COUNT=`redis-client 5 PUBLISH "$CHANNEL" "$path,$file,$event"`
-  CODE=$? 
-  if [ $CODE -eq 0 ]; then
-    info "Published $event for $file"
+  echo "hello"
+  # First we need to get the index of this path
+  index=-1
+  for watchdir in "${WATCH_DIRS[@]}"
+  do
+   :
+   if [[ $path == *"$watchdir"* ]]; then
+     echo "$"
+     break
+   fi
+   (( index++ ))
+   # do whatever on $i
+  done
+
+  if [ $index -eq -1 ] || [ $index -ge ${#CHANNELS[@]} ] || [ "${CHANNELS[$index]}" = ""  ]; then
+    bad "Could not find channel for path!"
+    continue
   else
-    bad "Failed to publish $event for $file error $CODE"
+    CHANNEL="${CHANNELS[$index]}"
+    SUBSCRIBER_COUNT=`redis-client 5 PUBLISH "$CHANNEL" "$path,$file,$event"`
+    CODE=$? 
+    if [ $CODE -eq 0 ]; then
+      info "Published $event for $file"
+    else
+      bad "Failed to publish $event for $file error $CODE"
+    fi
   fi
 done
   #if [[ "$tm" == "$last_tm" ]]; then

@@ -1,0 +1,6 @@
+[submodule "libs/task-logger"]
+	path = libs/task-logger
+	url = https://github.com/posva/task-logger.sh.git
+[submodule "libs/redis-bash"]
+	path = libs/redis-bash
+	url = https://github.com/caquino/redis-bash.git
